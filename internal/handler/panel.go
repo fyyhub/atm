@@ -283,17 +283,35 @@ func parseCredAuto(text string) (lanes.SaveCreds, error) {
 // 回环限制能在「0.0.0.0 监听」误暴露时挡住局域网改钥，同时不把合法的
 // 本机用户锁在门外。反代暴露场景的运维应在反代层加保护（README 已注明）。
 
-// loopbackOnly 写操作回环闸门：非回环 RemoteAddr → 403。
-func (s *Server) loopbackOnly(w http.ResponseWriter, r *http.Request) bool {
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		host = r.RemoteAddr
-	}
-	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+// writeGate 写操作闸门：回环 或 有效面板会话 二选一。
+// 面板密码已是真实闸门时，登录会话的远程运维与回环等权；
+// 无密码裸奔部署时远程写继续拒绝（loopbackOnly 原语义保住）。
+func (s *Server) writeGate(w http.ResponseWriter, r *http.Request) bool {
+	if isLoopbackAddr(r.RemoteAddr) || s.validSession(r) {
 		return true
 	}
 	writeJSON(w, http.StatusForbidden, map[string]any{
-		"ok": false, "error": "密钥修改仅允许本机回环地址（127.0.0.1/::1）操作"})
+		"ok": false, "error": "写操作仅允许本机（回环）或已登录面板会话"})
+	return false
+}
+
+// isLoopbackAddr 判定 RemoteAddr 是否回环。
+func isLoopbackAddr(remoteAddr string) bool {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		host = remoteAddr
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// loopbackOnly 写操作回环闸门：非回环 RemoteAddr → 403。
+func (s *Server) loopbackOnly(w http.ResponseWriter, r *http.Request) bool {
+	if isLoopbackAddr(r.RemoteAddr) {
+		return true
+	}
+	writeJSON(w, http.StatusForbidden, map[string]any{
+		"ok": false, "error": "仅允许本机（回环）操作"})
 	return false
 }
 
@@ -335,7 +353,7 @@ func (s *Server) authGet(w http.ResponseWriter, r *http.Request) {
 // {"generate":true} 只生成不落盘（生成与保存分离——直接保存+启用曾把用户
 // 锁在门外：toast 3.5s 后密钥永不可见）。仅回环可写。
 func (s *Server) authSetKey(w http.ResponseWriter, r *http.Request) {
-	if !s.loopbackOnly(w, r) {
+	if !s.writeGate(w, r) {
 		return
 	}
 	body, _, ok := readJSONBody(r)
@@ -372,7 +390,7 @@ func (s *Server) authSetKey(w http.ResponseWriter, r *http.Request) {
 // authDisable POST /admin/api/auth/disable {"disable":true|false}：
 // 显式关闭/恢复鉴权（压过环境变量；UI 侧已二次确认+风险提示）。仅回环可写。
 func (s *Server) authDisable(w http.ResponseWriter, r *http.Request) {
-	if !s.loopbackOnly(w, r) {
+	if !s.writeGate(w, r) {
 		return
 	}
 	body, _, ok := readJSONBody(r)

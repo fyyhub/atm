@@ -247,37 +247,19 @@ func (l *loginRateLimiter) ok(ip string) {
 
 // ── 路由与闸门 ────────────────────────────────────────────────────────────────
 
-// panelOpenPaths 面板登录闸门的豁免路径：登录/登出/密码管理/密码重置/API_KEY 自救。
-var panelOpenPaths = map[string]bool{
-	"/admin/api/login":          true,
-	"/admin/api/logout":         true,
-	"/admin/api/password":       true,
-	"/admin/api/password/reset": true,
-	"/admin/api/auth":           true,
-	"/admin/api/auth/disable":   true,
-}
-
-// panelGate /admin 与 /admin/api/* 的会话闸门（Handler 最外层）。
-// 未设密码 → 直通（现状）；未登录 GET /admin → 登录页（200，不是 401 空白）；
-// 未登录 /admin/api/* → 401 JSON。
+// panelGate 只管 /admin HTML 页（Handler 最外层）：设了面板密码且无有效会话 →
+// 登录页（200，不是 401 空白）。/admin/api/* 不在此拦——凭证判定归 guard：
+// 有效面板会话 或 API_KEY 任一即可（P6：API_KEY 是管理接口的程序化凭证，
+// 面板密码是浏览器人类的凭证，二者对管理 API 等权；互不越权数据面）。
 func (s *Server) panelGate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		p := r.URL.Path
-		if (p != "/admin" && !strings.HasPrefix(p, "/admin/api/")) || panelOpenPaths[p] {
-			next.ServeHTTP(w, r)
-			return
-		}
-		if s.settings.PanelPasswordHash == "" || s.validSession(r) {
-			next.ServeHTTP(w, r)
-			return
-		}
-		if p == "/admin" && r.Method == http.MethodGet {
+		if r.URL.Path == "/admin" && r.Method == http.MethodGet &&
+			s.settings.PanelPasswordHash != "" && !s.validSession(r) {
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			_, _ = w.Write([]byte(loginPageHTML))
 			return
 		}
-		writeJSON(w, http.StatusUnauthorized, map[string]any{
-			"error": "需要登录", "login": "/admin"})
+		next.ServeHTTP(w, r)
 	})
 }
 
@@ -370,9 +352,9 @@ func (s *Server) panelPassword(w http.ResponseWriter, r *http.Request) {
 }
 
 // panelPasswordReset POST /admin/api/password/reset：忘记密码的恢复主路径。
-// 仅回环、无需会话——与「本机可直接改 settings.json」等权，不制造虚假安全。
+// 回环 或 有效面板会话（writeGate）：忘记密码走回环；已登录者从远程清密也合法。
 func (s *Server) panelPasswordReset(w http.ResponseWriter, r *http.Request) {
-	if !s.loopbackOnly(w, r) {
+	if !s.writeGate(w, r) {
 		return
 	}
 	s.settings.PanelPasswordHash = ""

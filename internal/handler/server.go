@@ -199,10 +199,28 @@ func (s *Server) nextRID() string { return fmt.Sprintf("r%04d", s.reqSeq.Add(1))
 
 // ── 本地鉴权闸门（对应 _guard / _cred_guard，逐端点显式调用，与 Python 一致）──
 
-// guard API_KEY 门：未配置放行；配置后必须 Authorization: Bearer <API_KEY>。
-// 读当前生效密钥（面板可热更新），不是启动时的 env 快照。
+// guard 数据/管理接口闸门。
+//
+// /admin/api/*：面板会话 或 API_KEY 任一有效即放行（P6：登录面板后不再二次
+// 要密钥；API_KEY 仍是管理接口的程序化凭证）。会话优先判定——带过期/错误的
+// localStorage 密钥但有会话时不因此被拒。「免凭证」仅在两种凭证都未配置时
+// 成立（纯本地裸奔）；只要设了任一种，就必须出示一种。
+// 其余路径（/v1/*、/status、/pool/status）只认 API_KEY：面板密码不越权数据面。
 func (s *Server) guard(w http.ResponseWriter, r *http.Request) bool {
 	key := s.currentAPIKey()
+	if strings.HasPrefix(r.URL.Path, "/admin/") {
+		if s.validSession(r) {
+			return true
+		}
+		if key != "" && r.Header.Get("Authorization") == "Bearer "+key {
+			return true
+		}
+		if key == "" && s.settings.PanelPasswordHash == "" {
+			return true // 双凭证皆无 = 纯本地开放（P4 原语义）
+		}
+		writeJSON(w, http.StatusUnauthorized, openAIErrorBody("invalid api key", "auth_error"))
+		return false
+	}
 	if key == "" || r.Header.Get("Authorization") == "Bearer "+key {
 		return true
 	}

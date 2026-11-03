@@ -72,7 +72,7 @@ function esc(s){const d=document.createElement("div");d.textContent=s==null?"":S
 // 401 内联引导：提示 + 密钥输入框 + 保存自动重试（不切页）
 function needKeyHTML(note){
   return '<div class="card"><h3 class="warn">需要 API 密钥</h3>'
-    +'<div class="dim" style="font-size:12px;margin-bottom:8px">'+esc(note||'服务端已启用 API_KEY 鉴权，数据接口需要携带密钥。密钥在服务器的 .env / 环境变量里（或诊断页面板设置过）。')+'</div>'
+    +'<div class="dim" style="font-size:12px;margin-bottom:8px">'+esc(note||'服务端已启用 API_KEY 鉴权，数据接口需要携带密钥。密钥在服务器的 .env / 环境变量里（或诊断页面板设置过）；已设面板密码的话，登录面板即免密钥。')+'</div>'
     +'<input id="inlineKey" type="password" placeholder="粘贴 API_KEY" style="width:260px"> '
     +'<button onclick="saveInlineKey()">保存并重试</button> <span id="inkOut"></span></div>';
 }
