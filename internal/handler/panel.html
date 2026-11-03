@@ -175,7 +175,9 @@ async function loadAccts(){
     +(rows||'<tr><td colspan="6" class="dim">空——在下方粘贴 auth.toml 内容添加第一个账号</td></tr>')
     +'</table></div>'
     +'<div class="card"><h3>添加账号</h3>'
-    +'<div class="dim" style="font-size:12px;margin-bottom:8px">粘贴 auth.toml 全文（含 access_token / refresh_token / [user] 表）。录入即校验：token 临期先试刷新，再拉一次套餐状态；失败的账号标记「凭据失效」并展示原因，不会静默。</div>'
+    +'<div style="margin-bottom:10px"><button onclick="oauthBegin()">OAuth 登录添加（推荐）</button> <span class="dim" style="font-size:12px">浏览器授权即完成，无需手工粘贴凭据</span></div>'
+    +'<div id="oauthBox" style="display:none;margin-bottom:12px"></div>'
+    +'<div class="dim" style="font-size:12px;margin-bottom:8px">或粘贴 auth.toml 全文（含 access_token / refresh_token / [user] 表）。录入即校验：token 临期先试刷新，再拉一次套餐状态；失败的账号标记「凭据失效」并展示原因，不会静默。</div>'
     +'<textarea id="tomlIn" placeholder="access_token = &quot;...&quot;&#10;refresh_token = &quot;...&quot;&#10;expires_in = 604800&#10;created_at = 1793600000&#10;&#10;[user]&#10;id = &quot;...&quot;&#10;username = &quot;...&quot;"></textarea>'
     +'<div style="margin-top:8px"><button onclick="addAccount(this)">校验并添加</button> <span id="addOut"></span></div></div>'
     +'<div class="card"><h3>批量导入</h3>'
@@ -264,6 +266,41 @@ async function disableAuth(off){
   if(r&&r.ok&&off){keyClear()}
   toast(r&&r.ok?(off?'已禁用鉴权':'已恢复鉴权'):'失败：'+(r&&r.error||''),!(r&&r.ok));loadAuth();load();
 }
+// ── OAuth 登录添加账号（三步向导，复用平台轮询流，无需粘贴回调）──
+let oauthSid=null,oauthTimer=null;
+async function oauthBegin(){
+  const box=$("#oauthBox");box.style.display="block";
+  box.innerHTML='<div class="dim">正在发起授权会话…</div>';
+  const r=await api("/admin/api/oauth/start",{method:"POST",body:"{}"});
+  if(!r||!r.ok){box.innerHTML='<div class="bad">发起失败：'+esc(r&&r.error||"未知错误")+'</div>';return}
+  oauthSid=r.session_id;
+  box.innerHTML='<div style="border:1px solid var(--line);border-radius:8px;padding:12px">'
+    +'<b>第 1/2 步：打开授权页完成授权</b>'
+    +'<div class="mono" style="word-break:break-all;font-size:12px;margin:8px 0">'+esc(r.login_url)+'</div>'
+    +'<a href="'+esc(r.login_url)+'" target="_blank" rel="noopener"><button>打开授权页</button></a> '
+    +'<button class="ghost" onclick="oauthAbort()">取消</button>'
+    +'<div class="dim" style="font-size:12px;margin-top:8px">在打开的页面里登录并同意授权；本页面会<b>自动检测</b>授权完成（无需复制任何地址），10 分钟内有效。</div>'
+    +'<div id="oauthProg" class="dim" style="margin-top:8px">等待授权…</div></div>';
+  oauthPoll();
+}
+async function oauthPoll(){
+  if(!oauthSid)return;
+  const r=await api("/admin/api/oauth/poll",{method:"POST",body:JSON.stringify({session_id:oauthSid})});
+  const prog=$("#oauthProg");
+  if(!r){if(prog)prog.innerHTML='<span class="bad">网络错误，3 秒后重试…</span>';oauthTimer=setTimeout(oauthPoll,3000);return}
+  if(r.ok&&r.status==="waiting"){if(prog)prog.textContent="等待授权…（"+new Date().toLocaleTimeString()+"）";oauthTimer=setTimeout(oauthPoll,2000);return}
+  if(r.ok&&r.status==="done"){
+    const acc=r.account||{};
+    $("#oauthBox").innerHTML='<div class="ok">✔ 登录成功，账号已入池：<b>'+esc(acc.username||"")+'</b>（'+esc(acc.plan||"套餐拉取中")+'）</div>';
+    oauthSid=null;toast("账号已添加："+(acc.username||""));loadAccts();load();return;
+  }
+  // expired / gone / error：明确原因 + 可重来
+  $("#oauthBox").innerHTML='<div class="bad">'+esc(r.error||"登录未完成")+'</div>'
+    +'<button class="ghost" onclick="oauthBegin()">重新发起</button>';
+  oauthSid=null;
+}
+function oauthAbort(){if(oauthTimer)clearTimeout(oauthTimer);oauthSid=null;$("#oauthBox").style.display="none";$("#oauthBox").innerHTML=""}
+
 // ── 面板密码 ──
 async function loadPw(){
   const a=await api("/admin/api/auth");

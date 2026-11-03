@@ -53,6 +53,11 @@ type Server struct {
 	// loginRate 面板登录限速（P5）。
 	loginRate *loginRateLimiter
 
+	// oauthSess 面板 OAuth 向导会话表（P7）；OAuthBase 测试注入 acs 基址。
+	oauthSessMu sync.Mutex
+	oauthSess   map[string]*panelOAuthSess
+	OAuthBase   string
+
 	reqSeq atomic.Int64
 
 	// OrKey OpenRouter API key。Python 版在模块导入时一次性读取，路由请求期
@@ -277,6 +282,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /admin/api/logout", s.panelLogout)
 	mux.HandleFunc("POST /admin/api/password", s.panelPassword)
 	mux.HandleFunc("POST /admin/api/password/reset", s.panelPasswordReset)
+	mux.HandleFunc("POST /admin/api/oauth/start", s.oauthStart)
+	mux.HandleFunc("POST /admin/api/oauth/poll", s.oauthPoll)
 	return s.panelGate(mux)
 }
 
