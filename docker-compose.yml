@@ -5,13 +5,18 @@ services:
     restart: unless-stopped
     ports:
       - "8788:8788"
+    # 敏感配置走 .env（.env 不入库；公网暴露必须设 API_KEY）
+    env_file:
+      - .env
     environment:
-      - API_KEY=${API_KEY}
-      - HOST=${HOST:-0.0.0.0}
-      - PORT=${PORT:-8788}
-      # 凭据文件通过 `-auth` 参数指定，容器内挂载到 /app/data/auth.toml
+      - HOST=0.0.0.0
+      - PORT=8788
+      - STATE_DIR=/app/data
     volumes:
+      # 持久化状态：accounts/ pool-state.json import/ server.log
       - ./data:/app/data
+      # 初始账号种子（auth.toml / auth.json 形状，只读挂载，首次启动导入后可清空）
+      - ./deploy/seed-accounts:/seed:ro
     networks:
       - atomcode2api_net
 

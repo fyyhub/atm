@@ -30,7 +30,6 @@ import (
 
 	"atomcode2api/internal/config"
 	"atomcode2api/internal/handler"
-	"atomcode2api/internal/lanes"
 )
 
 func main() {
@@ -47,46 +46,38 @@ func main() {
 	s.AuthTOML = credPath                                 // 空串时 lanes 内部回落到默认路径
 	s.AuthJSON = filepath.Join(cfg.StateDir, "auth.json") // 网关独立凭据文件（刷新/登录产物）
 
-	// 对应 Python __main__ 的凭据装载分支
-	cred, err := lanes.NewCredential(s.AuthTOML, s.AuthJSON, logger)
-	if err != nil {
-		if errors.Is(err, lanes.ErrNotLoggedIn) {
-			logger.Warn("尚未登录，CodingPlan 路由不可用——GET /login 开始 OAuth 登录（OpenRouter 路由不受影响）")
-		} else {
-			logger.Error("凭据装载失败", slog.String("err", err.Error()))
-		}
+	// 账号池（P1）：旧单账号凭据一次性迁移为池账号 #1（复制，原文件保留）；
+	// -auth 语义变为初始导入源。之后凭据事实源 = StateDir/accounts/*.json。
+	s.Pool.MigrateLegacy(s.AuthTOML, s.AuthJSON)
+
+	if s.Pool.Count() == 0 {
+		logger.Warn("尚未登录，CodingPlan 路由不可用——GET /login 开始 OAuth 登录（OpenRouter 路由不受影响）")
 	} else {
-		username := cred.Username()
-		if username == "" {
-			username = "未命名"
+		for _, a := range s.Pool.List() {
+			username := a.Username
+			if username == "" {
+				username = "未命名"
+			}
+			logger.Info("凭证账号", slog.String("username", username), slog.String("uid", a.ID))
 		}
-		logger.Info("凭证账号", slog.String("username", username), slog.String("uid", cred.UserID()))
-		if cred.IsExpired() {
+		// 启动只对代表账号做临期刷新（对齐旧单账号行为，不批量打上游）
+		if cred := s.PoolDefaultCred(); cred != nil && cred.IsExpired() {
 			logger.Info("token 已过期，尝试刷新...")
 			if err := cred.Refresh(); err != nil {
 				logger.Error("token 刷新失败", slog.String("err", err.Error()))
 			}
 		}
-		s.SetCred(cred)
-		s.Con.ClaimPlan(s)
 		printStatus(s)
-
-		// 每日自动领取免费 CodingPlan。
-		// 幂等——已持有（duplicate）与领取失败都只记日志。ATOMCODE_AUTO_CLAIM=0 关闭。
-		if os.Getenv("ATOMCODE_AUTO_CLAIM") != "0" {
-			go func() {
-				for range time.Tick(24 * time.Hour) {
-					res := s.Con.ClaimBest(s)
-					if res.OK {
-						logger.Info("[claim] 每日领取", slog.String("tier", res.Tier),
-							slog.String("plan", res.Plan), slog.String("msg", res.Message))
-					} else {
-						logger.Warn("[claim] 每日领取未成功", slog.String("msg", res.Message))
-					}
-				}
-			}()
-		}
 	}
+
+	// 目录扫描导入（P2）：启动先扫一次，之后随 60s 快照循环定期扫。
+	s.Pool.ScanImportDir()
+
+	// 后台循环：pool-state 60s 快照+导入扫描；领取走 60s 到期间隔（录入即安排、
+	// 失败 30min 重试）；每日错峰复活+状态校准。ATOMCODE_AUTO_CLAIM=0 关自动领取。
+	claimEnabled := os.Getenv("ATOMCODE_AUTO_CLAIM") != "0"
+	go s.Pool.SnapshotLoop(context.Background())
+	go s.Pool.AutoLoop(context.Background(), claimEnabled)
 
 	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
 	srv := &http.Server{

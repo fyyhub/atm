@@ -27,6 +27,8 @@ import (
 type SendError struct {
 	Status int
 	Body   map[string]any // {"error": {"message":..., "type":...}}
+	// RetryAfter 秒（>0 时路由层设 Retry-After 头；目前仅账号池耗尽使用）。
+	RetryAfter int
 }
 
 // Cred 上游凭据来源（*lanes.Credential 实现）。每次发送现取 Headers()——

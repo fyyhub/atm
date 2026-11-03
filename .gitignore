@@ -1,6 +1,7 @@
 # Go 构建产物
 *.exe
 *.exe~
+dist/
 # 运行时产物
 *.log
 logs/
@@ -11,3 +12,13 @@ credentials.json
 .cred/
 .env
 .env.*
+# 账号池运行时状态与种子（含真实凭据，绝不入库）
+accounts/
+pool-state.json
+auth.json
+settings.json
+import/
+data/
+deploy/seed-accounts/
+# 本地验证产物
+atomcode2api-linux-*

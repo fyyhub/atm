@@ -626,6 +626,7 @@ func TestAuthGates(t *testing.T) {
 
 	// 配置 API_KEY 后无 Bearer → 401 auth_error
 	fx.s.Cfg.APIKey = "sk-test"
+	fx.s.recomputeAuth() // P4 起鉴权读运行时快照，改 Cfg 后需重算
 	for _, path := range []string{"/v1/chat/completions", "/v1/responses", "/v1/messages", "/v1/models", "/status"} {
 		method := http.MethodPost
 		var body any = map[string]any{"model": "m", "messages": []any{

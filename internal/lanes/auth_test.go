@@ -460,3 +460,26 @@ func TestOAuthStartUpstreamError(t *testing.T) {
 		t.Errorf("err=%v，期望带 HTTP 500", err)
 	}
 }
+
+// SaveAuthJSON 写盘后含 user 表且可读回（种子/池凭据自描述）。
+func TestSaveAuthJSON_UserRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "a.json")
+	sc := SaveCreds{
+		AccessToken: "at", RefreshToken: "rt", ExpiresIn: 604800, CreatedAt: 1,
+		User: User{ID: "u1", Username: "alice", AvatarURL: "http://a/b.png"}, HasUser: true,
+	}
+	if err := SaveAuthJSON(path, sc); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	back, err := ParseAuthJSON(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !back.HasUser || back.User.ID != "u1" || back.User.Username != "alice" || back.User.AvatarURL != "http://a/b.png" {
+		t.Fatalf("user 未回读: %+v", back.User)
+	}
+}

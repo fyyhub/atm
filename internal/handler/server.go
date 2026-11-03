@@ -21,6 +21,7 @@ import (
 	"atomcode2api/internal/config"
 	"atomcode2api/internal/control"
 	"atomcode2api/internal/lanes"
+	"atomcode2api/internal/pool"
 	"atomcode2api/internal/upstream"
 )
 
@@ -39,6 +40,19 @@ type Server struct {
 	cred    atomic.Pointer[lanes.Credential]
 	hasCred atomic.Bool
 
+	// Pool 多账号池（P1）。New 总是创建；调度走 Pool.Acquire()，
+	// Headers/Refresh/credOrNil 经 Pool.Default() 兼容单账号语义。
+	Pool *pool.Pool
+
+	// 面板设置与当前生效的鉴权状态（P4：settings.json 持久化 + 热更新）。
+	settings   *Settings
+	authMu     sync.RWMutex
+	authKey    string // 当前生效密钥（"" = 不鉴权）
+	authSource string // panel / env / off（面板禁用）/ none
+
+	// loginRate 面板登录限速（P5）。
+	loginRate *loginRateLimiter
+
 	reqSeq atomic.Int64
 
 	// OrKey OpenRouter API key。Python 版在模块导入时一次性读取，路由请求期
@@ -52,7 +66,7 @@ type Server struct {
 	AuthJSON string
 }
 
-// New 构造服务。cred 可为 nil（未登录）。
+// New 构造服务。cred 可为 nil（未登录）；非 nil 时注册为池账号（兼容旧调用方）。
 func New(cfg *config.Config, cred *lanes.Credential, logger *slog.Logger) *Server {
 	s := &Server{
 		Cfg:   cfg,
@@ -63,25 +77,97 @@ func New(cfg *config.Config, cred *lanes.Credential, logger *slog.Logger) *Serve
 		OrKey: cfg.OpenRouterAPIKey,
 	}
 	s.Up.OpenRouterKey = cfg.OpenRouterAPIKey
+	s.Pool = pool.New(cfg.StateDir, s.Con, logger)
+	s.settings = loadSettings(cfg.StateDir, func(msg string) {
+		logger.Warn("settings 加载", slog.String("warn", msg))
+	})
+	s.loginRate = newLoginRateLimiter()
+	s.recomputeAuth()
 	if cred != nil {
 		s.SetCred(cred)
 	}
 	return s
 }
 
+// recomputeAuth 重算当前生效密钥与来源（改设置/启动时调用）。
+// 优先级：面板显式设置 > 环境变量 API_KEY > 未启用；面板禁用压过 env。
+func (s *Server) recomputeAuth() {
+	s.authMu.Lock()
+	defer s.authMu.Unlock()
+	switch {
+	case s.settings.APIKey != "":
+		s.authKey, s.authSource = s.settings.APIKey, "panel"
+	case s.settings.AuthDisabled:
+		s.authKey, s.authSource = "", "off"
+	case s.Cfg.APIKey != "":
+		s.authKey, s.authSource = s.Cfg.APIKey, "env"
+	default:
+		s.authKey, s.authSource = "", "none"
+	}
+}
+
+// currentAPIKey 当前生效密钥（鉴权中间件每次现读——保存后立即对后续请求
+// 生效，进行中的请求不受影响）。
+func (s *Server) currentAPIKey() string {
+	s.authMu.RLock()
+	defer s.authMu.RUnlock()
+	return s.authKey
+}
+
+// authSourceLabel 生效来源的面板文案。
+func (s *Server) authSourceLabel() string {
+	s.authMu.RLock()
+	defer s.authMu.RUnlock()
+	switch s.authSource {
+	case "panel":
+		return "面板"
+	case "env":
+		return "环境变量"
+	case "off":
+		return "已禁用（面板关闭）"
+	}
+	return "未启用"
+}
+
 // SetCred 换入凭据并启用 CodingPlan 路由（启动装载与 /login/poll 完成后调用）。
+// 池化后同时注册进账号池（幂等：同 user.id 视为替换）。
 func (s *Server) SetCred(c *lanes.Credential) {
 	s.cred.Store(c)
 	s.hasCred.Store(true)
+	if s.Pool != nil {
+		if _, err := s.Pool.AddCredential(c); err != nil {
+			s.Log.Warn("凭据注册入池失败", slog.String("err", err.Error()))
+		}
+	}
 }
 
 // ClearCred 置为未登录（auth.toml 运行期被删时的兜底；Python 版无此路径）。
+// 池化后同步清空池内账号（仅内存），否则 credGuard 仍会被池放行。
 func (s *Server) ClearCred() {
 	s.cred.Store(nil)
 	s.hasCred.Store(false)
+	if s.Pool != nil {
+		s.Pool.Clear()
+	}
 }
 
+// credOrNil 取「代表凭据」：优先池内最优账号（池化后 /status、overview、
+// adminRefresh 等单账号语义端点共用），空池回落 legacy 指针。
 func (s *Server) credOrNil() *lanes.Credential {
+	return s.poolCredOrLegacy()
+}
+
+// PoolDefaultCred 池代表凭据（main 启动流程用），无则 nil。
+func (s *Server) PoolDefaultCred() *lanes.Credential {
+	return s.credOrNil()
+}
+
+func (s *Server) poolCredOrLegacy() *lanes.Credential {
+	if s.Pool != nil {
+		if a := s.Pool.Default(); a != nil {
+			return a.Cred
+		}
+	}
 	if !s.hasCred.Load() {
 		return nil
 	}
@@ -114,8 +200,9 @@ func (s *Server) nextRID() string { return fmt.Sprintf("r%04d", s.reqSeq.Add(1))
 // ── 本地鉴权闸门（对应 _guard / _cred_guard，逐端点显式调用，与 Python 一致）──
 
 // guard API_KEY 门：未配置放行；配置后必须 Authorization: Bearer <API_KEY>。
+// 读当前生效密钥（面板可热更新），不是启动时的 env 快照。
 func (s *Server) guard(w http.ResponseWriter, r *http.Request) bool {
-	key := s.Cfg.APIKey
+	key := s.currentAPIKey()
 	if key == "" || r.Header.Get("Authorization") == "Bearer "+key {
 		return true
 	}
@@ -123,8 +210,12 @@ func (s *Server) guard(w http.ResponseWriter, r *http.Request) bool {
 	return false
 }
 
-// credGuard 未登录（无 auth.toml）时 401 提示；已登录放行。
+// credGuard 未登录（空池且无 legacy 凭据）时 401 提示；有账号即放行——
+// 账号全冷却/失效由调度层 Acquire 失败回 429 pool_exhausted（P1 语义）。
 func (s *Server) credGuard(w http.ResponseWriter) bool {
+	if s.Pool != nil && s.Pool.Count() > 0 {
+		return true
+	}
 	if s.credOrNil() != nil {
 		return true
 	}
@@ -149,11 +240,26 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/login/poll", s.loginPoll)
 	mux.HandleFunc("/health", s.health)
 	mux.HandleFunc("/status", s.status)
+	mux.HandleFunc("GET /pool/status", s.poolStatus)
 	mux.HandleFunc("/admin", s.servePanel)
 	mux.HandleFunc("/admin/api/overview", s.overview)
 	mux.HandleFunc("/admin/api/refresh-token", s.adminRefresh)
 	mux.HandleFunc("/admin/api/claim", s.adminClaim)
-	return mux
+	mux.HandleFunc("GET /admin/api/accounts", s.accountsList)
+	mux.HandleFunc("POST /admin/api/accounts", s.accountsAdd)
+	mux.HandleFunc("POST /admin/api/accounts/batch", s.accountsBatch)
+	mux.HandleFunc("DELETE /admin/api/accounts/{id}", s.accountsDelete)
+	mux.HandleFunc("POST /admin/api/accounts/{id}/disable", s.accountsDisable)
+	mux.HandleFunc("POST /admin/api/accounts/{id}/enable", s.accountsEnable)
+	mux.HandleFunc("POST /admin/api/accounts/{id}/reset", s.accountsReset)
+	mux.HandleFunc("GET /admin/api/auth", s.authGet)
+	mux.HandleFunc("POST /admin/api/auth", s.authSetKey)
+	mux.HandleFunc("POST /admin/api/auth/disable", s.authDisable)
+	mux.HandleFunc("POST /admin/api/login", s.panelLogin)
+	mux.HandleFunc("POST /admin/api/logout", s.panelLogout)
+	mux.HandleFunc("POST /admin/api/password", s.panelPassword)
+	mux.HandleFunc("POST /admin/api/password/reset", s.panelPasswordReset)
+	return s.panelGate(mux)
 }
 
 // ── /v1/models：控制面目录 + OpenRouter 免费模型 ────────────────────────────
@@ -236,6 +342,38 @@ func (s *Server) quotaStatus() map[string]any {
 	}
 }
 
+// ── /pool/status：池级全量视图（P3）──────────────────────────────────────────
+
+// poolStatus GET /pool/status：全量账号视图（状态/窗口/冷却/成功率/最近使用/
+// 最近错误）+ 池级汇总。/status 的单账号语义不变。
+func (s *Server) poolStatus(w http.ResponseWriter, r *http.Request) {
+	if !s.guard(w, r) {
+		return
+	}
+	now := time.Now()
+	list := []any{}
+	healthy := 0
+	for _, a := range s.Pool.List() {
+		v := accountView(a, now)
+		if tot := a.TotalOK + a.TotalFail; tot > 0 {
+			v["success_rate"] = float64(a.TotalOK) / float64(tot)
+		} else {
+			v["success_rate"] = nil
+		}
+		list = append(list, v)
+		if a.Status(now) == "ok" {
+			healthy++
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"accounts":         list,
+		"count":            s.Pool.Count(),
+		"healthy":          healthy,
+		"cap":              pool.MaxAccounts,
+		"retry_after_hint": s.Pool.MinCooldownSeconds(),
+	})
+}
+
 // ── /login、/login/poll：网关自建 OAuth（平台代持流）────────────────────────
 
 func (s *Server) loginStart(w http.ResponseWriter, r *http.Request) {
@@ -265,30 +403,21 @@ func (s *Server) loginPoll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sc := creds.ToSaveCreds()
-	if err := s.saveCreds(sc); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"status": "error", "message": err.Error()})
-		return
-	}
-	nc, err := lanes.NewCredential(s.AuthTOML, s.AuthJSON, s.Log) // 双源重建（auth.json 优先）
+	// P2：OAuth 登录直接入池（accounts/<id>.json），不再写单 auth.json；
+	// 同账号重复登录走替换（保留调度统计并清失效标记）。
+	acct, err := s.Pool.AddOrReplace(sc)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"status": "error", "message": err.Error()})
 		return
 	}
-	s.SetCred(nc)
+	s.cred.Store(acct.Cred)
+	s.hasCred.Store(true)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":   "done",
 		"username": creds.User.Username,
 		"uid":      creds.User.IDStr(),
-		"message":  "登录成功，凭据已写入 auth.json，网关已切换到新凭据",
+		"message":  "登录成功，凭据已入池（accounts/" + acct.ID + ".json），网关已切换到新凭据",
 	})
-}
-
-// saveCreds 落盘新凭据到网关独立凭据文件 auth.json（不再写 auth.toml）。
-func (s *Server) saveCreds(sc lanes.SaveCreds) error {
-	if s.AuthJSON == "" {
-		s.AuthJSON = filepath.Join(s.Cfg.StateDir, "auth.json")
-	}
-	return lanes.SaveAuthJSON(s.AuthJSON, sc)
 }
 
 // logIn 出 in: 行（对应 routes/chat.py 的 logger.info("[%s] in: ...")；

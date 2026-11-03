@@ -1,0 +1,39 @@
+# AtomCode2api 一键编排（含账号种子导入与状态持久化）。
+#
+# 用法（在仓库根目录）：
+#   cp deploy/.env.example .env   # 填入 API_KEY
+#   docker compose -f deploy/docker-compose.yml up -d --build
+#
+# 目录约定（宿主机，相对仓库根）：
+#   data/                  持久化状态卷 → 容器 /app/data（accounts/ pool-state.json import/ server.log）
+#   deploy/seed-accounts/  初始账号种子（*.toml / *.json，只读挂载 → 容器 /seed）
+services:
+  atomcode2api:
+    build:
+      context: ..          # 用根目录已修复的 Dockerfile
+    image: atomcode2api:local
+    container_name: atomcode2api
+    restart: unless-stopped
+    ports:
+      - "8788:8788"
+    env_file:
+      - ../.env            # 敏感配置（API_KEY 等），不入库
+    environment:
+      - HOST=0.0.0.0
+      - PORT=8788
+      - STATE_DIR=/app/data
+    volumes:
+      - ../data:/app/data                 # 状态持久化
+      - ./seed-accounts:/seed:ro          # 账号种子（只读）
+    # 与 Dockerfile 内一致的健康检查（compose 层显式声明，便于覆盖）
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8788/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    networks:
+      - atomcode2api_net
+
+networks:
+  atomcode2api_net:
+    driver: bridge

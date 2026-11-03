@@ -32,17 +32,20 @@ th{color:var(--dim);font-weight:400}
 .bar i.hot{background:var(--warn)}
 #msg{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#1f2430;border:1px solid var(--line);border-radius:8px;padding:10px 18px;font-size:13px;display:none;max-width:80vw}
 input{background:#0d0f13;border:1px solid var(--line);border-radius:6px;color:var(--tx);padding:7px 10px;font-size:13px;width:180px}
+textarea{background:#0d0f13;border:1px solid var(--line);border-radius:6px;color:var(--tx);padding:8px 10px;font:12px Consolas,monospace;width:100%;min-height:140px;box-sizing:border-box}
 </style>
 </head>
 <body>
 <div class="wrap">
-<h1>AtomCode2api 控制台</h1>
+<h1>AtomCode2api 控制台 <button class="ghost" id="logoutBtn" style="float:right;display:none" onclick="logout()">登出</button></h1>
 <div class="tabs">
 <button class="on" onclick="tab(this,'vMain')">概览</button>
+<button onclick="tab(this,'vAccts')">账号</button>
 <button onclick="tab(this,'vModels')">模型</button>
 <button onclick="tab(this,'vDiag')">诊断</button>
 </div>
 <div id="vMain"></div>
+<div id="vAccts" style="display:none"></div>
 <div id="vModels" style="display:none"></div>
 <div id="vDiag" style="display:none"></div>
 </div>
@@ -50,13 +53,40 @@ input{background:#0d0f13;border:1px solid var(--line);border-radius:6px;color:va
 <script>
 "use strict";
 const $=s=>document.querySelector(s);
-function authHeaders(){const k=localStorage.ac_apikey;if(!k)return{"Content-Type":"application/json"};return{"Content-Type":"application/json","Authorization":"Bearer "+k}}
-const api=(p,opt={})=>fetch(p,Object.assign({headers:authHeaders()},opt)).then(r=>r.json()).catch(e=>({error:String(e)}));
+// ── 客户端密钥读写（诊断页鉴权卡片与 401 内联提示共用这一套，行为一致）──
+function keyGet(){return localStorage.ac_apikey||""}
+function keySet(k){localStorage.ac_apikey=k}
+function keyClear(){delete localStorage.ac_apikey}
+function authHeaders(){const k=keyGet();if(!k)return{"Content-Type":"application/json"};return{"Content-Type":"application/json","Authorization":"Bearer "+k}}
+// api 统一数据请求：所有面板请求都带 localStorage 密钥；错误一律提取可读文案
+// （服务端 error.message 优先），401 归一成 {needKey:true}，绝不出现 [object Object]。
+const api=(p,opt={})=>fetch(p,Object.assign({headers:authHeaders()},opt)).then(async r=>{
+  const j=await r.json().catch(()=>({}));
+  if(r.status===401)return{needKey:true,error:"需要 API 密钥：请填入服务端 API_KEY"};
+  if(!r.ok)return{httpErr:r.status,error:(j&&j.error&&j.error.message)||(j&&j.message)||("HTTP "+r.status)};
+  return j;
+}).catch(e=>({error:"网络错误: "+String(e)}));
 const POST=p=>api(p,{method:"POST",body:"{}"});
 let tt;function toast(t,bad){const m=$("#msg");m.textContent=t;m.style.display="block";m.style.color=bad?"var(--bad)":"var(--tx)";clearTimeout(tt);tt=setTimeout(()=>m.style.display="none",3500)}
 function esc(s){const d=document.createElement("div");d.textContent=s==null?"":String(s);return d.innerHTML}
+// 401 内联引导：提示 + 密钥输入框 + 保存自动重试（不切页）
+function needKeyHTML(note){
+  return '<div class="card"><h3 class="warn">需要 API 密钥</h3>'
+    +'<div class="dim" style="font-size:12px;margin-bottom:8px">'+esc(note||'服务端已启用 API_KEY 鉴权，数据接口需要携带密钥。密钥在服务器的 .env / 环境变量里（或诊断页面板设置过）。')+'</div>'
+    +'<input id="inlineKey" type="password" placeholder="粘贴 API_KEY" style="width:260px"> '
+    +'<button onclick="saveInlineKey()">保存并重试</button> <span id="inkOut"></span></div>';
+}
+async function saveInlineKey(){
+  const k=document.getElementById("inlineKey").value.trim();
+  if(!k)return;
+  keySet(k);
+  const probe=await api("/admin/api/overview");
+  if(probe&&probe.needKey){$("#inkOut").innerHTML='<span class="bad">密钥不对（服务端仍 401），请核对后重试</span>';return}
+  toast('已保存');load();loadAccts();
+}
 function tab(btn,id){document.querySelectorAll(".tabs button").forEach(b=>b.classList.remove("on"));btn.classList.add("on");
-  ["vMain","vModels","vDiag"].forEach(v=>$("#"+v).style.display=v===id?"":"none")}
+  ["vMain","vAccts","vModels","vDiag"].forEach(v=>$("#"+v).style.display=v===id?"":"none");
+  if(id==="vAccts")loadAccts()}
 // 时间值兼容 unix 秒（数字或数字字符串）与上游原样字符串
 function fmtTime(v){if(v==null||v==="")return "—";const n=Number(v);if(Number.isFinite(n)&&n>1e9){const d=new Date(n*1000);return d.toLocaleString("zh-CN",{hour12:false})}return String(v)}
 function fmtDur(sec){const n=Number(sec);if(!Number.isFinite(n))return "—";const h=Math.floor(n/3600),m=Math.floor(n%3600/60),s=Math.round(n%60);return (h?h+"时":"")+(m?m+"分":"")+s+"秒"}
@@ -66,19 +96,20 @@ function fmtTok(n){const x=Number(n);return Number.isFinite(x)?x.toLocaleString(
 let OV=null;
 async function load(){
   const o=await api("/admin/api/overview");
-  if(!o||!o.credential){$("#vMain").innerHTML='<div class="card bad">overview 加载失败：'+esc(o&&o.error||"")+'</div>';return}
+  if(o&&o.needKey){$("#vMain").innerHTML=needKeyHTML();return}
+  if(!o||!o.credential){$("#vMain").innerHTML='<div class="card bad">overview 加载失败：'+esc(o&&o.error||"未知错误")+'</div>';return}
   OV=o;
   const c=o.credential;
   const pct=(c.window_limit>0)?Math.min(100,Math.round(c.window_used/c.window_limit*100)):null;
   $("#vMain").innerHTML=`
   <div class="card"><h3>凭据</h3><div class="kv">
-    <b>状态</b><span class="${c.valid?"ok":"bad"}">${c.valid?"有效":"未登录——先跑官方 <code>atomcode login</code>，或 <a class="mono" href="/login">GET /login</a> 走网关 OAuth"}</span>
+    <b>状态</b><span class="${c.valid?"ok":"bad"}">${c.valid?"有效":'未登录——先跑官方 <code>atomcode login</code>，或 <a class="mono" href="/login">GET /login</a> 走网关 OAuth'}</span>
     ${c.valid?`
     <b>用户</b><span>${esc(c.username||"—")} <span class="dim mono">${esc(c.uid||"")}</span></span>
     <b>套餐</b><span>${esc(c.plan||"—")} <span class="dim">${esc(c.status||"")}</span></span>
     <b>套餐到期</b><span>${esc(fmtTime(c.expires_at))}${c.remaining_days!=null?` <span class="dim">（剩 ${esc(c.remaining_days)} 天）</span>`:""}</span>
     <b>token 到期</b><span>${esc(fmtTime(c.token_expires_at))}</span>`:""}
-    <b>本地鉴权</b><span>${o.local_auth?`<span class="badge on">API_KEY 已开启</span> <input id="k" placeholder="API Key" value="${esc(localStorage.ac_apikey||"")}"> <button class="ghost" onclick="localStorage.ac_apikey=document.getElementById('k').value;toast('已保存')">保存</button>`:'<span class="badge off">未开启（仅回环）</span>'}</span>
+    <b>本地鉴权</b><span>${o.local_auth?`<span class="badge on">API_KEY 已开启</span> <input id="k" placeholder="API Key" value="${esc(keyGet())}"> <button class="ghost" onclick="keySet(document.getElementById('k').value);toast('已保存')">保存</button>`:'<span class="badge off">未开启（仅回环）</span>'}</span>
   </div></div>
   ${c.valid?`<div class="card"><h3>5h 窗口水位</h3><div class="kv">
     <b>已用 / 上限</b><span>${esc(fmtTok(c.window_used))} / ${esc(fmtTok(c.window_limit))}${pct!=null?` <span class="dim">（${pct}%）</span>`:""}</span>
@@ -95,7 +126,12 @@ async function load(){
   <div class="card"><h3>凭据</h3><button onclick="doRefresh(this)">刷新令牌</button> <span id="rfOut"></span></div>
   <div class="card"><h3>免费套餐领取 <span class="dim">（每日自动跑一次；Max→Pro→Lite 级联，已持有不会重复领）</span></h3>
   <button class="ghost" onclick="doClaim(this,1)">只看状态</button>
-  <button onclick="doClaim(this,0)">立即领取</button> <span id="clOut"></span></div>`;
+  <button onclick="doClaim(this,0)">立即领取</button> <span id="clOut"></span></div>
+  <div class="card"><h3>API 鉴权密钥</h3><div id="authBox" class="kv"></div>
+  <div class="dim" style="font-size:12px;margin-top:10px">⚠️ /admin 面板本身无鉴权：任何能访问本端口的人都能看此页。密钥写操作仅允许回环地址；本服务若需公网暴露，请在反向代理层加保护，且务必设置 API_KEY。优先级：面板显式设置 &gt; 环境变量 API_KEY &gt; 未启用；「清除面板值」= 回落环境变量，不等于关闭鉴权。</div></div>
+  <div class="card"><h3>面板密码</h3><div id="pwBox" class="kv"></div>
+  <div class="dim" style="font-size:12px;margin-top:10px">设置后 /admin 需要登录（HttpOnly 会话 cookie，12 小时有效）。忘记密码：本机执行 <span class="mono">curl -X POST http://127.0.0.1:8788/admin/api/password/reset</span> 或删除 StateDir 下 settings.json 的 panel_password 字段。</div></div>`;
+  loadAuth();loadPw()
 }
 async function doClaim(btn,preview){btn.disabled=true;
   $("#clOut").textContent=preview?"查询中…":"领取中…";
@@ -110,7 +146,157 @@ async function doHealth(btn){btn.disabled=true;
     $("#hpOut").innerHTML=`<span class="${r.ok?"ok":"bad"}">${r.ok?"ok":"HTTP "+r.status} ${esc(JSON.stringify(j))}</span>`}
   catch(e){$("#hpOut").innerHTML='<span class="bad">'+esc(String(e))+'</span>'}
   btn.disabled=false}
-load();
+// ── 账号池 ──
+async function loadAccts(){
+  const r=await api("/admin/api/accounts");
+  const el=$("#vAccts");
+  if(r&&r.needKey){el.innerHTML=needKeyHTML();return}
+  if(!r||r.error){el.innerHTML='<div class="card bad">账号列表加载失败：'+esc(r&&r.error||"未知错误")+'</div>';return}
+  const rows=(r.accounts||[]).map(a=>{
+    const st=a.status==="ok"?'<span class="ok">正常</span>'
+      :a.status==="cooling"?'<span class="warn">冷却中（剩 '+a.cooldown_remaining+'s）</span>'
+      :a.status==="auth_invalid"?'<span class="bad">凭据失效</span>'
+      :'<span class="dim">已禁用</span>';
+    const win=a.window_limit>0?fmtTok(a.window_used)+' / '+fmtTok(a.window_limit):'—';
+    const err=a.last_error?'<div class="bad mono" style="font-size:11px;margin-top:2px">'+esc(a.last_error)+'</div>':'';
+    return '<tr><td>'+esc(a.username||'—')+'<div class="dim mono" style="font-size:11px">'+esc(a.id)+'</div></td>'
+      +'<td>'+st+err+'</td>'
+      +'<td class="dim">'+esc(a.plan||'—')+(a.next_claim_at&&a.next_claim_at.indexOf('0001')!==0?'<div style="font-size:11px">下次领取 '+esc(fmtTime(a.next_claim_at))+'</div>':'')+'</td>'
+      +'<td class="mono">'+win+'</td>'
+      +'<td class="dim">'+a.total_ok+' / '+a.total_fail+'</td>'
+      +'<td><button class="ghost" onclick="acctAction(\''+esc(a.id)+'\',\'reset\')">重置状态</button> '
+      +(a.disabled
+        ?'<button class="ghost" onclick="acctAction(\''+esc(a.id)+'\',\'enable\')">启用</button> '
+        :'<button class="ghost" onclick="acctAction(\''+esc(a.id)+'\',\'disable\')">禁用</button> ')
+      +'<button class="ghost" onclick="acctDel(\''+esc(a.id)+'\')">删除</button></td></tr>'
+  }).join('');
+  el.innerHTML='<div class="card"><h3>账号池 <span class="dim">（'+r.count+' / '+r.cap+'）</span></h3>'
+    +'<table><tr><th>账号</th><th>状态</th><th>套餐</th><th>窗口已用/上限</th><th>成功/失败</th><th>操作</th></tr>'
+    +(rows||'<tr><td colspan="6" class="dim">空——在下方粘贴 auth.toml 内容添加第一个账号</td></tr>')
+    +'</table></div>'
+    +'<div class="card"><h3>添加账号</h3>'
+    +'<div class="dim" style="font-size:12px;margin-bottom:8px">粘贴 auth.toml 全文（含 access_token / refresh_token / [user] 表）。录入即校验：token 临期先试刷新，再拉一次套餐状态；失败的账号标记「凭据失效」并展示原因，不会静默。</div>'
+    +'<textarea id="tomlIn" placeholder="access_token = &quot;...&quot;&#10;refresh_token = &quot;...&quot;&#10;expires_in = 604800&#10;created_at = 1793600000&#10;&#10;[user]&#10;id = &quot;...&quot;&#10;username = &quot;...&quot;"></textarea>'
+    +'<div style="margin-top:8px"><button onclick="addAccount(this)">校验并添加</button> <span id="addOut"></span></div></div>'
+    +'<div class="card"><h3>批量导入</h3>'
+    +'<div class="dim" style="font-size:12px;margin-bottom:8px">多条凭据用单独一行 <span class="mono">---</span> 分隔；每条自动识别 auth.toml 或 auth.json（JSON）格式，逐条校验，单条失败不影响整批。</div>'
+    +'<textarea id="batchIn" placeholder="条目 1（auth.toml 或 auth.json）&#10;---&#10;条目 2&#10;---&#10;..."></textarea>'
+    +'<div style="margin-top:8px"><button onclick="batchAdd(this)">批量校验导入</button></div><div id="batchOut"></div></div>';
+}
+async function addAccount(btn){
+  btn.disabled=true;$("#addOut").textContent='校验中…';
+  const r=await api("/admin/api/accounts",{method:"POST",body:JSON.stringify({toml:$("#tomlIn").value})});
+  if(r&&r.ok){
+    const a=r.account||{};
+    $("#addOut").innerHTML=a.status==='ok'?'<span class="ok">已添加并验证通过</span>':'<span class="warn">已添加，但校验未通过：'+esc(a.last_error||'')+'</span>';
+    $("#tomlIn").value='';loadAccts();
+  }else{$("#addOut").innerHTML='<span class="bad">'+esc(r&&r.error||'失败')+'</span>'}
+  btn.disabled=false}
+async function acctAction(id,act){
+  const r=await POST('/admin/api/accounts/'+encodeURIComponent(id)+'/'+act);
+  toast(r&&r.ok?'已执行':'操作失败：'+(r&&r.error||''),!(r&&r.ok));loadAccts()}
+async function acctDel(id){
+  if(!confirm('确认删除账号 '+id+'？凭据文件一并删除，不可恢复。'))return;
+  const r=await api('/admin/api/accounts/'+encodeURIComponent(id),{method:'DELETE'});
+  toast(r&&r.ok?'已删除':'删除失败：'+(r&&r.error||''),!(r&&r.ok));loadAccts()}
+async function batchAdd(btn){
+  btn.disabled=true;$("#batchOut").textContent='逐条校验中…';
+  const r=await api("/admin/api/accounts/batch",{method:"POST",body:JSON.stringify({text:$("#batchIn").value})});
+  if(!r||!r.ok){$("#batchOut").innerHTML='<span class="bad">'+esc(r&&r.error||'失败')+'</span>'}
+  else{
+    const rows=(r.results||[]).map(x=>{
+      const tag=x.skipped?'<span class="warn">#'+x.index+' 跳过</span> '+esc(x.error||'')
+        :x.ok?'<span class="ok">#'+x.index+' 成功</span> '+esc(x.username||'')+' <span class="dim">'+esc(x.status||'')+'</span>'+(x.last_error?' <span class="warn">'+esc(x.last_error)+'</span>':'')
+        :'<span class="bad">#'+x.index+' 失败</span> '+esc(x.error||'');
+      return '<div style="padding:2px 0">'+tag+'</div>'}).join('');
+    $("#batchOut").innerHTML='<div style="margin-top:8px">导入 '+r.imported+' · 跳过 '+r.skipped+' · 失败 '+r.failed+'</div>'+rows;
+    $("#batchIn").value='';loadAccts();
+  }
+  btn.disabled=false}
+// ── API 鉴权密钥 ──
+async function loadAuth(){
+  const a=await api("/admin/api/auth");
+  const el=$("#authBox");
+  if(!a||a.error){if(el)el.innerHTML='<span class="bad">加载失败</span>';return}
+  const badge=a.enabled?'<span class="badge on">已启用</span>':'<span class="badge off">未启用</span>';
+  el.innerHTML='<b>状态</b><span>'+badge+'</span>'
+    +'<b>当前密钥</b><span class="mono">'+esc(a.masked_key||'—')+'</span>'
+    +'<b>生效来源</b><span>'+esc(a.source)+'</span>'
+    +'<b>环境变量</b><span class="dim">'+(a.env_present?'已设置（面板值优先）':'未设置')+'</span>'
+    +'<b>设置</b><span><input id="nk" placeholder="新密钥（≥8 位可见 ASCII）" style="width:260px"> '
+    +'<button class="ghost" onclick="genKey()">生成强随机</button> '
+    +'<button onclick="saveAuth()">保存并启用</button> '
+    +(a.panel_set?'<button class="ghost" onclick="clearAuth()">清除面板值</button> ':'')
+    +(a.auth_disabled
+      ?'<button class="ghost" onclick="disableAuth(false)">恢复鉴权</button>'
+      :'<button class="ghost" onclick="disableAuth(true)">禁用鉴权</button>')
+    +'</span><div id="genOut" style="margin-top:8px;grid-column:2"></div>';
+}
+async function genKey(){
+  const r=await api("/admin/api/auth",{method:"POST",body:JSON.stringify({generate:true})});
+  if(!r||!r.ok){toast('生成失败：'+(r&&r.error||''),true);return}
+  document.getElementById("nk").value=r.generated_key;
+  // 明文完整展示一次 + 一键复制；不落盘、不启用——保存是显式动作
+  $("#genOut").innerHTML='<div class="card" style="border-color:var(--warn);margin:0">'
+    +'<b class="warn">新密钥（仅此一次完整展示，请立即复制保存）：</b>'
+    +'<div class="mono" style="word-break:break-all;margin:6px 0" id="genKeyText">'+esc(r.generated_key)+'</div>'
+    +'<button class="ghost" onclick="navigator.clipboard.writeText(document.getElementById(\'genKeyText\').textContent).then(()=>toast(\'已复制\'))">复制</button>'
+    +'<span class="dim" style="margin-left:8px">点击「保存并启用」后才生效</span></div>';
+}
+async function saveAuth(){
+  const key=document.getElementById("nk").value;
+  if(!confirm('启用后所有 API 客户端必须带此密钥（Authorization: Bearer ...）。\n请确认你已经复制并保存了它。'))return;
+  const r=await api("/admin/api/auth",{method:"POST",body:JSON.stringify({api_key:key})});
+  if(r&&r.ok){
+    keySet(key); // 面板自身后续请求带钥，避免面板被自己锁死
+    toast('已保存，立即生效');$("#genOut").innerHTML='';loadAuth();load();
+  }else{toast('失败：'+(r&&r.error||''),true)}
+}
+async function clearAuth(){
+  if(!confirm('清除面板设置的密钥？\n若环境变量 API_KEY 有值，将回落到环境变量继续鉴权；没有则变为不鉴权。'))return;
+  const r=await api("/admin/api/auth",{method:"POST",body:JSON.stringify({api_key:""})});
+  if(r&&r.ok){keyClear()}
+  toast(r&&r.ok?'已清除（回落环境变量）':'失败：'+(r&&r.error||''),!(r&&r.ok));loadAuth();load();
+}
+async function disableAuth(off){
+  if(off&&!confirm('⚠️ 确认禁用 API 鉴权？\n\n禁用后任何能访问本端口的人都能直接调用所有接口（含环境变量里的密钥也不再生效）。仅限纯本机回环使用。'))return;
+  const r=await api("/admin/api/auth/disable",{method:"POST",body:JSON.stringify({disable:off})});
+  if(r&&r.ok&&off){keyClear()}
+  toast(r&&r.ok?(off?'已禁用鉴权':'已恢复鉴权'):'失败：'+(r&&r.error||''),!(r&&r.ok));loadAuth();load();
+}
+// ── 面板密码 ──
+async function loadPw(){
+  const a=await api("/admin/api/auth");
+  const on=a&&a.panel_password_set;
+  document.getElementById("logoutBtn").style.display=on?'':'none';
+  const el=$("#pwBox");
+  if(!el)return;
+  if(!a||a.error){el.innerHTML='<span class="bad">加载失败</span>';return}
+  el.innerHTML='<b>状态</b><span>'+(on?'<span class="badge on">已设置</span>':'<span class="badge off">未设置（面板无密码）</span>')+'</span>'
+    +'<b>操作</b><span>'
+    +(on?'<input id="curPw" type="password" placeholder="当前密码" style="width:140px"> ':'')
+    +'<input id="newPw" type="password" placeholder="新密码（≥8 位）" style="width:160px"> '
+    +'<button onclick="setPw()">'+(on?'修改密码':'设置密码')+'</button> '
+    +(on?'<button class="ghost" onclick="clearPw()">清除密码保护</button>':'')
+    +'</span>';
+}
+async function setPw(){
+  const body={new_password:document.getElementById("newPw").value};
+  const cur=document.getElementById("curPw");
+  if(cur)body.current_password=cur.value;
+  const r=await api("/admin/api/password",{method:"POST",body:JSON.stringify(body)});
+  if(r&&r.ok){toast('已生效');loadPw()}else{toast('失败：'+(r&&r.error||''),true)}
+}
+async function clearPw(){
+  if(!confirm('清除面板密码？之后 /admin 恢复无密码访问。'))return;
+  const r=await api("/admin/api/password",{method:"POST",body:JSON.stringify({clear:true})});
+  if(r&&r.ok){toast('已清除');loadPw()}else{toast('失败：'+(r&&r.error||''),true)}
+}
+async function logout(){
+  await api("/admin/api/logout",{method:"POST",body:"{}"});
+  location.href="/admin";
+}
+load();loadAccts();
 </script>
 </body>
 </html>

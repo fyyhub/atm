@@ -98,6 +98,13 @@ func Load() *Config {
 		loadDotEnv(filepath.Join(dir, ".env"))
 	}
 
+	// STATE_DIR 显式覆盖状态目录（server.log / auth.json / accounts/ /
+	// pool-state.json / import/ 全在这里）。Docker/裸机部署把它指到可写卷——
+	// 默认的 exe 目录在容器里是只读的。放在 .env 加载之后，.env 里也可写。
+	if v := strings.TrimSpace(os.Getenv("STATE_DIR")); v != "" {
+		c.StateDir = v
+	}
+
 	if h := strings.TrimSpace(os.Getenv("HOST")); h != "" {
 		c.Host = h
 	}

@@ -62,11 +62,11 @@ func AuthTOMLPath() string {
 
 // User 对应 auth.toml 的 [user] 表。
 type User struct {
-	ID        string
-	Username  string
-	Name      string
-	Email     string
-	AvatarURL string
+	ID        string `json:"id"`
+	Username  string `json:"username"`
+	Name      string `json:"name"`
+	Email     string `json:"email"`
+	AvatarURL string `json:"avatar_url"`
 }
 
 // creds auth.toml 解析结果（顶层凭据键 + 可选 user 表）。
@@ -351,15 +351,21 @@ func SaveCredentials(path string, sc SaveCreds) error {
 }
 
 // SaveAuthJSON 网关独立凭据文件（0600，原子替换）。
+// 带 [user] 信息（HasUser 时）——账号池的种子/凭据文件需要自描述，
+// 否则跨机器导入后丢 username/uid（2026-11-03 种子导入实测暴露）。
 func SaveAuthJSON(path string, sc SaveCreds) error {
-	b, err := json.MarshalIndent(map[string]any{
+	m := map[string]any{
 		"access_token":  sc.AccessToken,
 		"token_type":    orDefault(sc.TokenType, "Bearer"),
 		"refresh_token": sc.RefreshToken,
 		"expires_in":    sc.ExpiresIn,
 		"created_at":    sc.CreatedAt,
 		"saved_at":      time.Now().Format(time.RFC3339),
-	}, "", "  ")
+	}
+	if sc.HasUser {
+		m["user"] = sc.User
+	}
+	b, err := json.MarshalIndent(m, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -527,6 +533,41 @@ func parseAuthTOML(raw []byte) (creds, error) {
 		}
 	}
 	return c, nil
+}
+
+// ParseAuthTOML 解析 auth.toml 字节为 SaveCreds（账号池录入/迁移用）。
+// 与内部 parseAuthTOML 同严：残缺表头、无 = 行、未闭合字符串、裸词值一律报错。
+func ParseAuthTOML(raw []byte) (SaveCreds, error) {
+	c, err := parseAuthTOML(raw)
+	if err != nil {
+		return SaveCreds{}, err
+	}
+	return SaveCreds{
+		AccessToken:  c.AccessToken,
+		TokenType:    orDefault(c.TokenType, "Bearer"),
+		RefreshToken: c.RefreshToken,
+		ExpiresIn:    c.ExpiresIn,
+		CreatedAt:    c.CreatedAt,
+		User:         c.User,
+		HasUser:      c.HasUser,
+	}, nil
+}
+
+// ParseAuthJSON 解析 auth.json 字节为 SaveCreds（账号池迁移用）。
+func ParseAuthJSON(raw []byte) (SaveCreds, error) {
+	c, err := parseAuthJSON(raw)
+	if err != nil {
+		return SaveCreds{}, err
+	}
+	return SaveCreds{
+		AccessToken:  c.AccessToken,
+		TokenType:    orDefault(c.TokenType, "Bearer"),
+		RefreshToken: c.RefreshToken,
+		ExpiresIn:    c.ExpiresIn,
+		CreatedAt:    c.CreatedAt,
+		User:         c.User,
+		HasUser:      c.HasUser,
+	}, nil
 }
 
 // tomlScalar 解析单值：带引号字符串（必须闭合）或裸整数；残缺值报错。

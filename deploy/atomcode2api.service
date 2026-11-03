@@ -1,0 +1,48 @@
+# AtomCode2api systemd unit（裸机部署）。
+#
+# 安装：
+#   sudo useradd -r -s /usr/sbin/nologin atomcode || true
+#   sudo install -d -o atomcode -g atomcode -m 700 /var/lib/atomcode2api   # 状态目录
+#   sudo install -d -o atomcode -g atomcode /opt/atomcode2api              # 程序目录
+#   sudo install -o atomcode -g atomcode -m 555 atomcode2api /opt/atomcode2api/
+#   sudo cp deploy/atomcode2api.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now atomcode2api
+#
+# 账号种子：把 auth.toml/auth.json 文件放到 /var/lib/atomcode2api/import/
+# （属主 atomcode，权限 0600），服务每分钟自动扫描导入；或运行后用
+# /admin 面板在线添加。
+[Unit]
+Description=AtomCode2api — AtomCode CodingPlan multi-account API gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=atomcode
+Group=atomcode
+WorkingDirectory=/opt/atomcode2api
+Environment=HOST=0.0.0.0
+Environment=PORT=8788
+Environment=STATE_DIR=/var/lib/atomcode2api
+Environment=ATOMCODE_AUTO_CLAIM=1
+# 公网暴露必须设置 API_KEY：写进 /etc/atomcode2api.env（chmod 600），
+#   API_KEY=<强随机串>
+EnvironmentFile=-/etc/atomcode2api.env
+ExecStart=/opt/atomcode2api/atomcode2api
+Restart=on-failure
+RestartSec=3
+
+# ── 安全加固（与本程序兼容性已核对：无外设/内核/家目录需求，只需出网 + 写状态目录）──
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/atomcode2api
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target
